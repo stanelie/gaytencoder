@@ -72,6 +72,9 @@ handled automatically.
 | `HOSTNAME` | DHCP hostname; give each board a unique one |
 | `USE_DHCP` | `False` selects a static IP derived from the board's MAC |
 | `ENCODER_MODULUS` | counter span, `4096 * 100` — see [FINDINGS.md](FINDINGS.md) |
+| `LEAD_TIME_S` | video-pipeline latency to compensate (default only; NVM wins) |
+| `VELOCITY_WINDOW_S` | velocity averaging window (default only; NVM wins) |
+| `OSC_LISTEN_PORT` | port for live tuning messages |
 
 ### Second board
 
@@ -82,8 +85,15 @@ need changing for board 2:
 ```python
 HOSTNAME = "encoder-bridge-2"
 OSC_ADDRESS = "/encoder2/position"
+OSC_STATUS_ADDRESS = "/encoder2/status"
+OSC_CTRL_LEAD = "/encoder2/lead"        # control addresses too
+OSC_CTRL_WINDOW = "/encoder2/window"
+OSC_CTRL_SAVE = "/encoder2/save"
 MODBUS_SLAVE_ADDR = 1          # can stay 1 - separate buses, no collision
 ```
+
+Each board tunes independently, so the two can have different lead times if
+their video paths differ.
 
 `code.py` itself is identical on both boards.
 
@@ -100,12 +110,89 @@ fine here, since the two positions are consumed independently.
 One OSC message per changed reading:
 
 ```
-/encoder1/position  ,i  <int32 counts>
+/encoder1/position  ,f  <float32 counts, latency-compensated>
 ```
 
-Position is in raw encoder counts, ~11.8 counts/mm on this rig (measured:
-3545 counts over 300 mm). Values are signed and continuous through zero —
-see [FINDINGS.md](FINDINGS.md) for why that matters.
+Position is in encoder counts, ~11.8 counts/mm on this rig (measured: 3545
+counts over 300 mm). Values are signed and continuous through zero — see
+[FINDINGS.md](FINDINGS.md) for why that matters.
+
+Plus a low-rate diagnostic message (10 Hz by default) for tuning:
+
+```
+/encoder1/status  ,ffff  <raw counts> <velocity counts/s> <lead s> <window s>
+```
+
+---
+
+## Latency compensation
+
+The application is a moving LED screen acting as a physical "window" onto a
+virtual background rendered in Millumin. For the illusion to hold, the image
+must correspond to where the screen actually *is*. The video chain lags the
+physical screen by roughly half a second, so without compensation the
+background is always showing where the screen *was*.
+
+The board therefore extrapolates:
+
+```
+predicted = position + velocity × LEAD_TIME_S
+```
+
+At rest the correction is zero and the position is exact; the faster the
+screen moves, the further ahead it is projected.
+
+**This is only exact at constant velocity.** During acceleration it is wrong
+by roughly `Δvelocity × lead`. In practice the screen is ~300 lb and pushed by
+hand, so it cannot change speed quickly and the ramps are gentle.
+
+**Compensation is not a substitute for fixing the latency.** Half a second is
+~30 frames; if any of it can be removed from the video chain, that is worth
+more than predicting around it, because prediction can only guess.
+
+### Tuning it live
+
+`LEAD_TIME_S` has to be dialled in against the real pipeline, so both it and
+the velocity window are adjustable over OSC at runtime — no redeploy, and no
+USB access to a board mounted on a moving truck. Send to the board's IP on
+port `9001`:
+
+| Message | Effect |
+|---|---|
+| `/encoder1/lead <float>` | seconds of latency to compensate (0–5) |
+| `/encoder1/window <float>` | velocity averaging window, seconds (0.005–2) |
+| `/encoder1/save` | persist both to NVM |
+
+Out-of-range values are rejected and logged rather than applied. Saved values
+live in the board's NVM (not the filesystem, which the board cannot write
+while USB is attached) and are restored on boot; `config.py` only supplies
+defaults for a board that has never been tuned.
+
+Suggested procedure:
+
+1. Move the screen at a steady, representative speed.
+2. Adjust `/encoder1/lead` until the background stops sliding against the
+   screen — too low and it lags behind the move, too high and it leads.
+3. Stop the screen and watch for jitter or hunting in the still image. If
+   present, raise `/encoder1/window`; if the response feels sluggish when
+   starting and stopping, lower it.
+4. `/encoder1/save` once you are happy.
+
+`/encoder1/status` reports raw position, measured velocity and the current
+tuning values throughout, which makes it much easier to see what the board
+thinks is happening.
+
+### Why the velocity window matters
+
+Velocity is measured across a time window, never between adjacent samples.
+At ~230 Hz, one count of quantisation (~0.085 mm) across a single ~4 ms poll
+reads as ~20 mm/s of apparent velocity — which a 0.5 s lead turns into
+~10 mm of position jitter while the screen is completely still. Measuring
+across 150 ms instead divides that noise by roughly the ratio of the windows.
+
+The window is the classic smoothing trade-off: longer is steadier but slower
+to react, shorter is more responsive but noisier. Hence making it tunable
+alongside the lead time.
 
 ---
 

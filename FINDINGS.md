@@ -202,7 +202,46 @@ also provides useful back-pressure.
 
 ---
 
-## 5. Encoder reference
+## 5. Latency compensation by extrapolation
+
+The video chain lags the physical screen by ~0.5 s. The board compensates by
+projecting forward: `predicted = position + velocity × lead`.
+
+Three things are worth recording about this.
+
+**It is only exact at constant velocity.** During a change of speed the
+prediction is wrong by about `Δvelocity × lead` — at 0.5 m/s and a 0.5 s lead,
+a sudden stop would leave it projecting ~250 mm past the truth before settling
+back. The saving grace here is physics: the screen is ~300 lb and hand-pushed,
+so it cannot accelerate or stop quickly.
+
+**Velocity must be measured across a window, never between adjacent
+samples.** At ~230 Hz, one count of quantisation (~0.085 mm) across a single
+~4 ms poll reads as ~20 mm/s. A 0.5 s lead multiplies that into ~10 mm of
+position jitter *while standing still* — clearly visible in a projected
+image. Differencing across 150 ms divides the noise by roughly the ratio of
+the windows, bringing it under a millimetre.
+
+Confirmation that this works: at standstill the board reports `0.0 sends/s`.
+Since a message is only sent when the value changes, zero traffic means the
+predicted position is perfectly stable — no noise is leaking through the
+velocity term.
+
+**Both constants are tunable at runtime, and that is not a luxury.** The lead
+time can only be found empirically against the real pipeline, and the window
+trades smoothness against responsiveness with no correct answer. The board
+therefore listens for OSC on port 9001 and stores tuned values in NVM. The
+availability check costs one register read (~120 µs) a few times a second, so
+it is free in the hot loop; the board cannot write its own filesystem while
+USB is attached, hence NVM rather than a config file.
+
+**Compensation is second best.** Half a second is ~30 frames; anything that
+can be removed from the real video chain beats predicting around it, since
+prediction only ever guesses.
+
+---
+
+## 6. Encoder reference
 
 Briterencoder RS485 rope sensor, Modbus-RTU. Factory defaults: **9600 baud,
 slave address 1, query mode**.

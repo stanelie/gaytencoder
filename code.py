@@ -16,11 +16,13 @@ See config.py for network and OSC destination settings.
 import gc
 import struct
 import time
+from array import array
 
 import board
 import busio
 import digitalio
 import ipaddress
+import microcontroller
 import adafruit_wiznet5k.adafruit_wiznet5k_socketpool as socketpool
 from adafruit_wiznet5k.adafruit_wiznet5k import WIZNET5K
 
@@ -34,6 +36,15 @@ from config import (
     OSC_ADDRESS,
     MODBUS_SLAVE_ADDR,
     ENCODER_MODULUS,
+    LEAD_TIME_S,
+    VELOCITY_WINDOW_S,
+    MAX_SPEED_COUNTS_S,
+    OSC_LISTEN_PORT,
+    OSC_CTRL_LEAD,
+    OSC_CTRL_WINDOW,
+    OSC_CTRL_SAVE,
+    OSC_STATUS_ADDRESS,
+    OSC_STATUS_HZ,
 )
 
 _HALF_MODULUS = ENCODER_MODULUS // 2
@@ -167,7 +178,115 @@ ensure_encoder_baud(TARGET_BAUD)
 print("Encoder ready @ address %d, %d baud" % (MODBUS_SLAVE_ADDR, TARGET_BAUD))
 
 # ---------------------------------------------------------------------------
-# OSC message packing (address pattern + ",i" typetag + big-endian int32)
+# Velocity estimation and latency compensation
+# ---------------------------------------------------------------------------
+
+
+class VelocityEstimator:
+    """Velocity measured across a time window, not between adjacent samples.
+
+    A sample-to-sample difference is far too noisy to extrapolate from: one
+    count of quantisation (~0.085mm) across a single ~5ms poll reads as
+    ~17 mm/s, and a 0.5s lead turns that into ~8.5mm of position jitter while
+    the screen is standing still. Differencing across ~150ms instead divides
+    that noise by roughly the ratio of the windows.
+
+    Samples live in a ring buffer; the tail is advanced past anything older
+    than the window, so changing the window at runtime takes effect
+    immediately and costs nothing extra.
+
+    Timestamps are integer nanoseconds (time.monotonic_ns), because
+    time.monotonic() is a float whose resolution degrades with uptime - by
+    itself enough to corrupt a 150ms measurement during a long show.
+    """
+
+    def __init__(self, capacity=400):
+        self._pos = array("i", [0] * capacity)
+        self._t = array("q", [0] * capacity)
+        self._cap = capacity
+        self._head = 0
+        self._tail = 0
+
+    def update(self, position, t_ns, window_ns):
+        """Add a sample and return the current velocity in counts/second.
+
+        `window_ns` is the window in integer nanoseconds; the caller keeps it
+        precomputed because this runs a couple of hundred times a second.
+        """
+        cap = self._cap
+        idx = self._head
+        self._pos[idx] = position
+        self._t[idx] = t_ns
+
+        nxt = idx + 1
+        if nxt >= cap:
+            nxt = 0
+        if nxt == self._tail:  # ring full - drop the oldest sample
+            tail = self._tail + 1
+            self._tail = 0 if tail >= cap else tail
+        self._head = nxt
+
+        tail = self._tail
+        # Keep the oldest sample that is still inside the window.
+        while tail != idx and (t_ns - self._t[tail]) > window_ns:
+            tail += 1
+            if tail >= cap:
+                tail = 0
+        self._tail = tail
+
+        dt = t_ns - self._t[tail]
+        if dt <= 0:
+            return 0.0
+        return (position - self._pos[tail]) * 1000000000.0 / dt
+
+
+# Tuning values are held in NVM so they survive a power cycle. The board
+# cannot write its own CIRCUITPY filesystem while USB is attached, so
+# config.py only supplies the defaults for a board that has never been tuned.
+_NVM_MAGIC = b"ENC1"
+
+
+def load_tuning(default_lead, default_window):
+    try:
+        nvm = microcontroller.nvm
+        if nvm is None:
+            return default_lead, default_window, False
+        blob = nvm[0:12]
+        if bytes(blob[0:4]) != _NVM_MAGIC:
+            return default_lead, default_window, False
+        lead, window = struct.unpack(">ff", bytes(blob[4:12]))
+        # Refuse implausible stored values rather than trusting NVM blindly.
+        if 0.0 <= lead <= 5.0 and 0.005 <= window <= 2.0:
+            return lead, window, True
+    except (AttributeError, OSError, ValueError):
+        pass
+    return default_lead, default_window, False
+
+
+def save_tuning(lead, window):
+    try:
+        nvm = microcontroller.nvm
+        if nvm is None:
+            return False
+        nvm[0:12] = _NVM_MAGIC + struct.pack(">ff", lead, window)
+        return True
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+lead_time = LEAD_TIME_S
+velocity_window = VELOCITY_WINDOW_S
+lead_time, velocity_window, _restored = load_tuning(lead_time, velocity_window)
+print(
+    "Lead time %.3fs, velocity window %.3fs (%s)"
+    % (lead_time, velocity_window, "restored from NVM" if _restored else "from config.py")
+)
+
+velocity_estimator = VelocityEstimator()
+
+
+# ---------------------------------------------------------------------------
+# OSC message packing
 # ---------------------------------------------------------------------------
 
 
@@ -176,15 +295,69 @@ def _osc_pad(data):
     return data + b"\x00" * ((-len(data)) % 4)
 
 
-def build_osc_int_template(address):
-    """Return (message_bytes, offset_of_int32) for a fixed OSC int message.
+def build_osc_float_template(address):
+    """Return (message_bytes, offset_of_float32) for a fixed OSC float message.
 
-    Only the trailing int32 ever changes, so the message is built once and
+    Only the trailing float32 ever changes, so the message is built once and
     the value patched in place rather than re-encoded on every packet.
+
+    The compensated position is fractional (a measured count plus a predicted
+    fraction of one), so it is sent as a float rather than an int.
     """
     addr_part = _osc_pad(address.encode("utf-8"))
-    tag_part = _osc_pad(b",i")
+    tag_part = _osc_pad(b",f")
     return bytearray(addr_part + tag_part + b"\x00\x00\x00\x00"), len(addr_part) + len(tag_part)
+
+
+def osc_message(address, *args):
+    """Build an arbitrary OSC message. Used only for the low-rate status
+    message, so the allocations here do not matter."""
+    tags = ","
+    payload = b""
+    for arg in args:
+        if isinstance(arg, float):
+            tags += "f"
+            payload += struct.pack(">f", arg)
+        else:
+            tags += "i"
+            payload += struct.pack(">i", arg)
+    return _osc_pad(address.encode("utf-8")) + _osc_pad(tags.encode("utf-8")) + payload
+
+
+def parse_osc(data):
+    """Minimal OSC parser -> (address, [args]). Returns (None, None) if the
+    packet is not something we understand. Only 'f' and 'i' are decoded."""
+    try:
+        end = data.find(b"\x00")
+        if end < 0:
+            return None, None
+        address = str(data[:end], "utf-8")
+
+        # The address is null-padded to a multiple of 4 bytes.
+        pos = (end // 4 + 1) * 4
+        if len(data) <= pos or data[pos] != 0x2C:  # ord(",")
+            return address, []  # no typetag: treat as a bare trigger
+
+        tag_end = data.find(b"\x00", pos)
+        if tag_end < 0:
+            return address, []
+        tags = str(data[pos + 1 : tag_end], "utf-8")
+        # Typetag block is likewise null-padded to a multiple of 4.
+        pos = (tag_end // 4 + 1) * 4
+
+        args = []
+        for tag in tags:
+            if tag == "f":
+                args.append(struct.unpack_from(">f", data, pos)[0])
+                pos += 4
+            elif tag == "i":
+                args.append(struct.unpack_from(">i", data, pos)[0])
+                pos += 4
+            else:
+                break
+        return address, args
+    except (ValueError, IndexError, UnicodeError):
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +366,7 @@ def build_osc_int_template(address):
 
 
 class FastOSCSender:
-    """Send a fixed-shape OSC int message with minimal SPI overhead.
+    """Send OSC messages with minimal SPI overhead.
 
     The stock library needs ~32 busio SPI calls per packet: its 3-byte
     register header goes out as three separate write() calls, 16-bit
@@ -223,6 +396,8 @@ class FastOSCSender:
     _SOCK_SIZE = 0x800
     _SOCK_MASK = 0x7FF
 
+    _MAX_PAYLOAD = 128
+
     def __init__(self, sock, osc_address):
         interface = sock._interface  # noqa: SLF001
         socknum = sock._socknum  # noqa: SLF001
@@ -244,19 +419,27 @@ class FastOSCSender:
         self._cmd_buf = bytearray([0x00, self._SNCR, reg_write, self._CMD_SEND])
 
         # Payload buffer: 3-byte header + the OSC message, patched in place.
-        message, int_offset = build_osc_int_template(osc_address)
+        message, float_offset = build_osc_float_template(osc_address)
         self._msg_len = len(message)
-        self._data_buf = bytearray(3) + message
+        self._data_buf = bytearray(3) + message + bytearray(self._MAX_PAYLOAD - len(message))
         self._data_buf[2] = self._tx_ctrl
-        self._int_offset = 3 + int_offset
-        self._frame_len = 3 + self._msg_len
+        self._float_offset = 3 + float_offset
 
     def send(self, value):
-        device = self._device
-        n = self._msg_len
+        """Hot path: patch the float32 in place and send. No allocation."""
+        struct.pack_into(">f", self._data_buf, self._float_offset, float(value))
+        self._send_frame(self._msg_len)
 
-        # Patch the int32 payload in place - no message rebuild, no allocation.
-        struct.pack_into(">i", self._data_buf, self._int_offset, value)
+    def send_bytes(self, payload):
+        """Send an arbitrary pre-built OSC message (low-rate use)."""
+        n = len(payload)
+        if n > self._MAX_PAYLOAD:
+            raise ValueError("payload too large")
+        self._data_buf[3 : 3 + n] = payload
+        self._send_frame(n)
+
+    def _send_frame(self, n):
+        device = self._device
 
         # Each operation below MUST get its own `with device` block. In the
         # W5500's Variable Data Length Mode the address + control bytes are
@@ -287,7 +470,7 @@ class FastOSCSender:
         self._data_buf[0] = (address >> 8) & 0xFF
         self._data_buf[1] = address & 0xFF
         with device as bus:
-            bus.write(self._data_buf, end=self._frame_len)
+            bus.write(self._data_buf, end=3 + n)
 
         # 4. Advance the write pointer.
         pointer = (pointer + n) & 0xFFFF
@@ -299,6 +482,75 @@ class FastOSCSender:
         # 5. Issue SEND.
         with device as bus:
             bus.write(self._cmd_buf)
+
+
+class ControlListener:
+    """Non-blocking OSC control input for live tuning.
+
+    Asking the library whether anything arrived is expensive, so availability
+    is checked with the same single-transaction trick used for sending: one
+    read of the socket's RX Received Size register (~120us). Only when that
+    is non-zero do we fall back to the library's (slow) receive path, which
+    happens rarely - a few tuning messages during tech.
+    """
+
+    _SNRX_RSR = 0x0026
+
+    def __init__(self, sock):
+        interface = sock._interface  # noqa: SLF001
+        socknum = sock._socknum  # noqa: SLF001
+        self._device = interface._device  # noqa: SLF001
+        self._sock = sock
+        reg_read = (socknum << 5) + 0x08
+        self._rsr_out = bytearray([0x00, self._SNRX_RSR, reg_read, 0x00, 0x00])
+        self._rsr_in = bytearray(5)
+        self._buf = bytearray(256)
+
+    def poll(self):
+        """Return (address, args) for one pending message, or (None, None)."""
+        with self._device as bus:
+            bus.write_readinto(self._rsr_out, self._rsr_in)
+        if ((self._rsr_in[3] << 8) | self._rsr_in[4]) == 0:
+            return None, None
+        try:
+            count = self._sock.recv_into(self._buf, len(self._buf))
+        except OSError:
+            return None, None
+        if not count:
+            return None, None
+        # bytes() copy rather than a memoryview: CircuitPython memoryviews
+        # have no .find(). This path runs only when a tuning message actually
+        # arrives, so the allocation is irrelevant.
+        return parse_osc(bytes(self._buf[:count]))
+
+
+def apply_control(address, args):
+    """Handle one tuning command. Returns True if something changed."""
+    global lead_time, velocity_window
+
+    if address == OSC_CTRL_LEAD and args:
+        value = float(args[0])
+        if 0.0 <= value <= 5.0:
+            lead_time = value
+            print("lead time -> %.3fs" % lead_time)
+            return True
+        print("ignored out-of-range lead:", value)
+
+    elif address == OSC_CTRL_WINDOW and args:
+        value = float(args[0])
+        if 0.005 <= value <= 2.0:
+            velocity_window = value
+            print("velocity window -> %.3fs" % velocity_window)
+            return True
+        print("ignored out-of-range window:", value)
+
+    elif address == OSC_CTRL_SAVE:
+        if save_tuning(lead_time, velocity_window):
+            print("saved: lead=%.3fs window=%.3fs" % (lead_time, velocity_window))
+        else:
+            print("save failed (no NVM available)")
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +600,20 @@ while True:
         sock.connect((OSC_HOST, OSC_PORT))
         sender = FastOSCSender(sock, OSC_ADDRESS)
 
+        ctrl_sock = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
+        ctrl_sock.settimeout(0)
+        ctrl_sock.bind(("", OSC_LISTEN_PORT))
+        control = ControlListener(ctrl_sock)
+        print("Listening for tuning on port %d" % OSC_LISTEN_PORT)
+
+        status_interval = 1.0 / OSC_STATUS_HZ if OSC_STATUS_HZ else 0
+        next_status = time.monotonic()
+        control_countdown = 0
+        raw_value = 0
+        velocity = 0.0
+        cached_window = velocity_window
+        cached_window_ns = int(velocity_window * 1000000000.0)
+
         # eth.link_status is a full SPI register read (~470us). Checking it
         # every iteration cost ~5% of the loop budget, so it moves into the
         # once-per-second stats block below.
@@ -357,20 +623,73 @@ while True:
 
             if value is None:
                 error_count += 1
-            elif value != last_sent_value:
-                last_sent_value = value
-                try:
-                    sender.send(value)
-                    send_count += 1
-                except OSError as send_err:
-                    print("OSC send failed:", send_err)
+            else:
+                raw_value = value
+                if velocity_window != cached_window:
+                    cached_window = velocity_window
+                    cached_window_ns = int(velocity_window * 1000000000.0)
+                velocity = velocity_estimator.update(
+                    value, time.monotonic_ns(), cached_window_ns
+                )
+                # One bad reading must not fling the prediction across the stage.
+                if velocity > MAX_SPEED_COUNTS_S:
+                    velocity = MAX_SPEED_COUNTS_S
+                elif velocity < -MAX_SPEED_COUNTS_S:
+                    velocity = -MAX_SPEED_COUNTS_S
+
+                # Project forward by the pipeline latency, so the image lands
+                # where the screen will BE when it is finally displayed. Zero
+                # correction at rest; grows with speed.
+                predicted = value + velocity * lead_time
+
+                if predicted != last_sent_value:
+                    last_sent_value = predicted
+                    try:
+                        sender.send(predicted)
+                        send_count += 1
+                    except OSError as send_err:
+                        print("OSC send failed:", send_err)
+
+            # Tuning input, checked a few times a second rather than every
+            # iteration - one RX-size register read, ~120us when idle.
+            control_countdown -= 1
+            if control_countdown <= 0:
+                control_countdown = 20  # ~10 times/second at ~210Hz
+                address, args = control.poll()
+                if address is not None:
+                    apply_control(address, args)
 
             now = time.monotonic()
+
+            if status_interval and now >= next_status:
+                next_status = now + status_interval
+                try:
+                    sender.send_bytes(
+                        osc_message(
+                            OSC_STATUS_ADDRESS,
+                            float(raw_value),
+                            float(velocity),
+                            float(lead_time),
+                            float(velocity_window),
+                        )
+                    )
+                except (OSError, ValueError):
+                    pass
+
             elapsed = now - rate_window_start
             if elapsed >= 1.0:
                 print(
-                    "[rate] %.1f polls/s, %.1f sends/s (%d errors/s)"
-                    % (poll_count / elapsed, send_count / elapsed, error_count / elapsed)
+                    "[rate] %.1f polls/s, %.1f sends/s (%d errors/s)  "
+                    "pos=%d vel=%.0f cnt/s lead=%.3f win=%.3f"
+                    % (
+                        poll_count / elapsed,
+                        send_count / elapsed,
+                        error_count / elapsed,
+                        raw_value,
+                        velocity,
+                        lead_time,
+                        velocity_window,
+                    )
                 )
                 poll_count = 0
                 error_count = 0
