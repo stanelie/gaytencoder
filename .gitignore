@@ -1,0 +1,9 @@
+# CircuitPython / editor noise
+__pycache__/
+*.pyc
+.Trash-*
+.fseventsd/
+.metadata_never_index
+System Volume Information/
+.DS_Store
+Thumbs.db
