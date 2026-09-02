@@ -124,6 +124,32 @@ OSC_STATUS_TIMEOUT_S = 15
 OSC_ANNOUNCE_PORT = 9003
 OSC_ANNOUNCE_S = 2.0
 
+# --- Status LED ------------------------------------------------------------
+#
+# The board's onboard RGB LED as a glanceable state indicator:
+#
+#   red     booting, or link lost / encoder not answering
+#   blue    network up, IP acquired, not yet streaming
+#   green   running normally
+#   blue blink over green   position is moving
+#   red blink (0.2s)        settings received and written to NVM
+#
+# Brightness 0.0-1.0. Keep it low: this board rides on the moving screen, so
+# the LED may well be in the audience's sightline. Set 0 to disable the LED
+# entirely for performances - the console still reports everything.
+STATUS_LED_BRIGHTNESS = 0.15
+
+# Blue activity blink whenever the position changes.
+#
+# Deliberately rate-limited rather than one blink per change: the position
+# changes up to ~200 times a second while the screen moves, which the eye
+# cannot resolve - it would read as a steady green-blue blend, and would cost
+# hundreds of LED writes a second for nothing. Ten short pulses a second reads
+# as a clear flicker and costs about 20 writes a second.
+#
+# Set False to keep the LED steady green while running.
+STATUS_LED_ACTIVITY = True
+
 # Full span of the encoder's multi-turn counter, in raw counts:
 #   counts-per-turn (4096, the datasheet default) x multi-turn range (100 turns)
 #

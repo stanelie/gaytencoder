@@ -33,6 +33,31 @@ request echoed back before the encoder's reply — the code accounts for this.
 W5500 Ethernet is on the board's fixed SPI pins: `CLK=IO13`, `MOSI=IO11`,
 `MISO=IO12`, `CS=IO14`, `RST=IO9`.
 
+### Status LED
+
+The onboard RGB LED reports state at a glance:
+
+| Colour | Meaning |
+|---|---|
+| red | booting, or link lost / encoder not answering |
+| blue | network up, IP acquired, not yet streaming |
+| green | running normally |
+| blue blink over green | position is moving |
+| red blink, 0.2s | settings received and written to NVM |
+
+Brightness is `STATUS_LED_BRIGHTNESS` in `config.py`; set it to `0` to go dark
+for a performance, since this board rides on the moving screen and may be in
+the audience's sightline. `STATUS_LED_ACTIVITY = False` keeps a steady green
+without the movement flicker.
+
+> **The RJ45 link LED on this board reads backwards: dark means the link is
+> up.** The W5500's `LINKLED` pin is open-drain and active-low — it pulls low
+> when a link is established — and Waveshare wired the LED between that pin
+> and ground rather than to VCC. It is driven by the PHY hardware with no
+> controlling register, so this cannot be fixed in software. Use the RGB LED
+> instead, which is more informative anyway: it distinguishes "cable plugged
+> in" from "network actually usable".
+
 ---
 
 ## Setup
@@ -114,12 +139,19 @@ fine here, since the two positions are consumed independently.
 One OSC message per changed reading:
 
 ```
-/encoder1/position  ,f  <float32 counts, latency-compensated>
+/encoder1/position  ,i  <int32 counts, latency-compensated>
 ```
 
-Position is in encoder counts, ~11.8 counts/mm on this rig (measured: 3545
-counts over 300 mm). Values are signed and continuous through zero — see
-[FINDINGS.md](FINDINGS.md) for why that matters.
+Position is in whole encoder counts, ~11.8 counts/mm on this rig (measured:
+3545 counts over 300 mm), so one count is under 0.1mm and a fractional part
+would carry no usable information. Rounding also means a message only goes out
+when the count actually changes, rather than on every poll from jitter in the
+velocity estimate while the screen is barely moving.
+
+Values are signed and continuous through zero — see [FINDINGS.md](FINDINGS.md)
+for why that matters. Rounding is symmetric rather than truncating toward
+zero, which matters here precisely because the encoder's zero sits on its wrap
+point, where the screen rests.
 
 That is the **only** thing sent to `OSC_HOST` — the stream Millumin sees
 contains nothing else.

@@ -46,7 +46,14 @@ from config import (
     OSC_STATUS_TIMEOUT_S,
     OSC_ANNOUNCE_PORT,
     OSC_ANNOUNCE_S,
+    STATUS_LED_BRIGHTNESS,
+    STATUS_LED_ACTIVITY,
 )
+
+# Activity blink shape: short enough not to smear into the next one, spaced
+# far enough apart for the eye to resolve each pulse.
+_ACTIVITY_BLINK_MS = 45
+_ACTIVITY_GAP_MS = 100
 
 # Discovery beacon. Fixed address, no prefix: it is how a board says who it
 # is, so it cannot depend on knowing that already.
@@ -65,6 +72,96 @@ OSC_CTRL_SAVE = "/control/save"
 OSC_CTRL_PING = "/control/ping"
 
 _HALF_MODULUS = ENCODER_MODULUS // 2
+
+# supervisor.ticks_ms() counts 0..2**29-1 and then wraps (every ~6.2 days).
+# Every interval measured here is well under a second, so a difference that
+# comes out negative can only mean the counter wrapped in between, and adding
+# one period back is enough. That is two operations instead of the four a
+# general masked difference needs, in the hottest loop in the program.
+_TICKS_PERIOD = 1 << 29
+_TICKS_HALF = _TICKS_PERIOD >> 1
+
+
+# ---------------------------------------------------------------------------
+# Status LED
+# ---------------------------------------------------------------------------
+
+
+class StatusLED:
+    """The onboard RGB LED as a state indicator you can read across a stage.
+
+    Uses the core `neopixel_write` module rather than the `neopixel` library,
+    so there is nothing extra to install on the CIRCUITPY drive.
+
+    Flashing is non-blocking on purpose: sleeping 0.2s here would stall the
+    Modbus polling for ~50 samples, which is exactly the wrong thing to do to
+    acknowledge a settings change.
+    """
+
+    RED = (255, 0, 0)
+    GREEN = (0, 255, 0)
+    BLUE = (0, 0, 255)
+    OFF = (0, 0, 0)
+
+    def __init__(self, brightness):
+        self.flashing = False
+        self._base = self.OFF
+        self._enabled = False
+        self._flash_from = 0
+        self._flash_ms = 0
+        if not brightness or brightness <= 0:
+            return
+        try:
+            import neopixel_write
+
+            self._write = neopixel_write.neopixel_write
+            self._pin = digitalio.DigitalInOut(board.NEOPIXEL)
+            self._pin.direction = digitalio.Direction.OUTPUT
+            self._level = min(1.0, brightness)
+            self._buf = bytearray(3)
+            self._enabled = True
+        except (ImportError, AttributeError, ValueError) as exc:
+            print("status LED unavailable:", exc)
+
+    def _show(self, colour):
+        level = self._level
+        buf = self._buf
+        # This LED takes green, red, blue in that order.
+        buf[0] = int(colour[1] * level)
+        buf[1] = int(colour[0] * level)
+        buf[2] = int(colour[2] * level)
+        self._write(self._pin, buf)
+
+    def set(self, colour):
+        """Set the persistent state colour, and show it unless mid-flash."""
+        if not self._enabled:
+            return
+        self._base = colour
+        if not self.flashing:
+            self._show(colour)
+
+    def show(self, colour):
+        """Show a colour immediately without disturbing the state colour.
+
+        The caller owns the timing: in the hot loop that is a plain local
+        deadline, which avoids a global lookup and an attribute read on every
+        single pass just to ask whether a blink is in progress.
+        """
+        if not self._enabled:
+            return
+        self.flashing = True
+        self._show(colour)
+
+    def restore(self):
+        """Return to the state colour after a flash."""
+        if not self._enabled:
+            return
+        self.flashing = False
+        self._show(self._base)
+
+
+status_led = StatusLED(STATUS_LED_BRIGHTNESS)
+status_led.set(StatusLED.RED)  # booting
 
 # ---------------------------------------------------------------------------
 # RS485 / Modbus-RTU encoder reading
@@ -197,14 +294,6 @@ print("Encoder ready @ address %d, %d baud" % (MODBUS_SLAVE_ADDR, TARGET_BAUD))
 # ---------------------------------------------------------------------------
 # Velocity estimation and latency compensation
 # ---------------------------------------------------------------------------
-
-
-# supervisor.ticks_ms() counts 0..2**29-1 and then wraps (every ~6.2 days).
-# Every interval measured here is well under a second, so a difference that
-# comes out negative can only mean the counter wrapped in between, and adding
-# one period back is enough. That is two operations instead of the four a
-# general masked difference needs, in the hottest loop in the program.
-_TICKS_PERIOD = 1 << 29
 
 
 class VelocityEstimator:
@@ -419,17 +508,20 @@ def _osc_pad(data):
     return data + b"\x00" * ((-len(data)) % 4)
 
 
-def build_osc_float_template(address):
-    """Return (message_bytes, offset_of_float32) for a fixed OSC float message.
+def build_osc_int_template(address):
+    """Return (message_bytes, offset_of_int32) for a fixed OSC int message.
 
-    Only the trailing float32 ever changes, so the message is built once and
-    the value patched in place rather than re-encoded on every packet.
+    Only the trailing int32 ever changes, so the message is built once and the
+    value patched in place rather than re-encoded on every packet.
 
-    The compensated position is fractional (a measured count plus a predicted
-    fraction of one), so it is sent as a float rather than an int.
+    Position is sent as an integer count. One count is under 0.1mm on this rig,
+    so a fractional part carries no usable information - and rounding to whole
+    counts also stops the prediction from emitting a new value on every poll
+    when the screen is barely moving, since velocity quantisation would jitter
+    the fractional part even when the position had not really changed.
     """
     addr_part = _osc_pad(address.encode("utf-8"))
-    tag_part = _osc_pad(b",f")
+    tag_part = _osc_pad(b",i")
     return bytearray(addr_part + tag_part + b"\x00\x00\x00\x00"), len(addr_part) + len(tag_part)
 
 
@@ -565,15 +657,15 @@ class FastOSCSender:
 
     def set_address(self, osc_address):
         """Rebuild the prebuilt position message for a new OSC address."""
-        message, float_offset = build_osc_float_template(osc_address)
+        message, int_offset = build_osc_int_template(osc_address)
         self._msg_len = len(message)
         self._data_buf = bytearray(3) + message
         self._data_buf[2] = self._tx_ctrl
-        self._float_offset = 3 + float_offset
+        self._int_offset = 3 + int_offset
 
     def send(self, value):
-        """Hot path: patch the float32 in place and send. No allocation."""
-        struct.pack_into(">f", self._data_buf, self._float_offset, float(value))
+        """Hot path: patch the int32 in place and send. No allocation."""
+        struct.pack_into(">i", self._data_buf, self._int_offset, value)
         self._send_frame(self._data_buf, self._msg_len)
 
     def send_bytes(self, payload):
@@ -818,6 +910,7 @@ while True:
         if not USE_DHCP:
             configure_static_ip(eth, pool)
         print("IP address:", eth.pretty_ip(eth.ip_address))
+        status_led.set(StatusLED.BLUE)  # network up, not streaming yet
 
         sock = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
         sock.settimeout(0)
@@ -867,6 +960,15 @@ while True:
         cached_window_ms = int(velocity_window * 1000.0)
         # Bound method into a local: one attribute lookup saved per poll.
         estimator_update = velocity_estimator.update
+        activity_led = STATUS_LED_ACTIVITY and STATUS_LED_BRIGHTNESS > 0
+        last_blink_ms = 0
+        # 0 means "no flash in progress". Kept as a loop local so the steady
+        # state costs a single local truth test per pass.
+        led_flash_until = 0
+        led_show = status_led.show
+        led_restore = status_led.restore
+
+        status_led.set(StatusLED.GREEN)  # streaming
 
         # eth.link_status is a full SPI register read (~470us). Checking it
         # every iteration cost ~5% of the loop budget, so it moves into the
@@ -875,6 +977,10 @@ while True:
             value, err = try_read_position()
             poll_count += 1
 
+            # One reading of the clock per pass, shared by the velocity window
+            # and the LED timing, rather than each fetching its own.
+            now_ms = supervisor.ticks_ms()
+
             if value is None:
                 error_count += 1
             else:
@@ -882,9 +988,7 @@ while True:
                 if velocity_window != cached_window:
                     cached_window = velocity_window
                     cached_window_ms = int(velocity_window * 1000.0)
-                velocity = estimator_update(
-                    value, supervisor.ticks_ms(), cached_window_ms
-                )
+                velocity = estimator_update(value, now_ms, cached_window_ms)
                 # One bad reading must not fling the prediction across the stage.
                 if velocity > MAX_SPEED_COUNTS_S:
                     velocity = MAX_SPEED_COUNTS_S
@@ -894,7 +998,12 @@ while True:
                 # Project forward by the pipeline latency, so the image lands
                 # where the screen will BE when it is finally displayed. Zero
                 # correction at rest; grows with speed.
-                predicted = value + velocity * lead_time
+                #
+                # Rounded to a whole count: one count is under 0.1mm here, so
+                # the fraction is noise, and rounding stops a barely-moving
+                # screen from emitting a fresh value every poll purely from
+                # jitter in the velocity estimate.
+                predicted = round(value + velocity * lead_time)
 
                 if predicted != last_sent_value:
                     last_sent_value = predicted
@@ -903,6 +1012,21 @@ while True:
                         send_count += 1
                     except OSError as send_err:
                         print("OSC send failed:", send_err)
+
+                    # Blue pulse over the steady green while the position is
+                    # moving. Rate-limited: the position changes far faster
+                    # than the eye can follow, so one pulse per change would
+                    # blur into a solid colour and cost hundreds of LED writes
+                    # a second. Deferring while a flash is already running also
+                    # leaves the red save blink undisturbed.
+                    if activity_led and not led_flash_until:
+                        since = now_ms - last_blink_ms
+                        if since < 0:
+                            since += _TICKS_PERIOD
+                        if since >= _ACTIVITY_GAP_MS:
+                            last_blink_ms = now_ms
+                            led_flash_until = now_ms + _ACTIVITY_BLINK_MS
+                            led_show(StatusLED.BLUE)
 
             # Tuning input, checked a few times a second rather than every
             # iteration - one RX-size register read, ~120us when idle.
@@ -952,6 +1076,16 @@ while True:
                         except (OSError, RuntimeError) as dest_err:
                             print("could not retarget to %s: %s" % (osc_dest, dest_err))
                             osc_dest, osc_dest_port = active_dest
+
+            # Steady state is one local truth test; the rest only runs while a
+            # blink is actually on screen.
+            if led_flash_until:
+                remaining = led_flash_until - now_ms
+                if remaining < -_TICKS_HALF:
+                    remaining += _TICKS_PERIOD
+                if remaining <= 0:
+                    led_flash_until = 0
+                    led_restore()
 
             now = time.monotonic()
 
@@ -1007,6 +1141,12 @@ while True:
                         velocity_window,
                     )
                 )
+                # Red while the encoder is not answering, so a dead sensor is
+                # visible from across the stage rather than only in a console.
+                status_led.set(
+                    StatusLED.RED if error_count > poll_count // 2 else StatusLED.GREEN
+                )
+
                 poll_count = 0
                 error_count = 0
                 send_count = 0
@@ -1017,6 +1157,10 @@ while True:
                             "saved: lead=%.3fs window=%.3fs prefix=%s dest=%s:%d"
                             % (lead_time, velocity_window, osc_prefix, osc_dest, osc_dest_port)
                         )
+                        # Acknowledge the write where the operator is looking.
+                        # Overrides any activity blink; a save matters more.
+                        led_flash_until = supervisor.ticks_ms() + 200
+                        led_show(StatusLED.RED)
                     else:
                         print("auto-save failed (no NVM available)")
                     tuning_dirty = False
@@ -1027,7 +1171,9 @@ while True:
                     break
 
         print("Ethernet link down, reconnecting...")
+        status_led.set(StatusLED.RED)
 
     except (ConnectionError, RuntimeError, OSError) as conn_err:
         print("Ethernet connection error:", conn_err)
+        status_led.set(StatusLED.RED)
         time.sleep(5)
