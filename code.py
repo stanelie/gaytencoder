@@ -538,7 +538,10 @@ def apply_control(address, args):
     """Handle one tuning command. Returns True if something changed."""
     global lead_time, velocity_window
 
-    if address == OSC_CTRL_LEAD and args:
+    if address == OSC_CTRL_LEAD:
+        if not args:
+            print("%s needs a float argument" % address)
+            return False
         value = float(args[0])
         if 0.0 <= value <= 5.0:
             lead_time = value
@@ -546,7 +549,10 @@ def apply_control(address, args):
             return True
         print("ignored out-of-range lead:", value)
 
-    elif address == OSC_CTRL_WINDOW and args:
+    elif address == OSC_CTRL_WINDOW:
+        if not args:
+            print("%s needs a float argument" % address)
+            return False
         value = float(args[0])
         if 0.005 <= value <= 2.0:
             velocity_window = value
@@ -559,6 +565,15 @@ def apply_control(address, args):
             print("saved: lead=%.3fs window=%.3fs" % (lead_time, velocity_window))
         else:
             print("save failed (no NVM available)")
+
+    else:
+        # Almost always a prefix mismatch - e.g. a tuner set to /encoder2
+        # pointed at the board that answers to /encoder1. Say so rather than
+        # ignoring it, otherwise the slider just appears to do nothing.
+        print(
+            "ignored unknown address %s - this board answers to %s, %s, %s"
+            % (address, OSC_CTRL_LEAD, OSC_CTRL_WINDOW, OSC_CTRL_SAVE)
+        )
 
     return False
 
