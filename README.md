@@ -303,6 +303,19 @@ is write-only — there is no "what is your address" query — so discovery is b
 scan, which is only unambiguous with one device present. Not needed for the
 one-encoder-per-board layout, but useful for identifying an unlabelled unit.
 
+### `tools/test_velocity.py`
+
+Checks the velocity estimator on a desktop Python, no hardware needed:
+
+```bash
+python3 tools/test_velocity.py
+```
+
+It extracts the class from `code.py` so the tests cannot drift from what runs
+on the board. Worth running after touching anything in that class — it covers
+the `ticks_ms` rollover, a path that otherwise only executes once every 6.2
+days in production.
+
 ### `bench_spi.py`, `diag_send.py`
 
 Diagnostics from the performance work. `bench_spi.py` measures per-SPI-call

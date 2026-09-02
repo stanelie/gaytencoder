@@ -23,6 +23,7 @@ import busio
 import digitalio
 import ipaddress
 import microcontroller
+import supervisor
 import adafruit_wiznet5k.adafruit_wiznet5k_socketpool as socketpool
 from adafruit_wiznet5k.adafruit_wiznet5k import WIZNET5K
 
@@ -198,6 +199,14 @@ print("Encoder ready @ address %d, %d baud" % (MODBUS_SLAVE_ADDR, TARGET_BAUD))
 # ---------------------------------------------------------------------------
 
 
+# supervisor.ticks_ms() counts 0..2**29-1 and then wraps (every ~6.2 days).
+# Every interval measured here is well under a second, so a difference that
+# comes out negative can only mean the counter wrapped in between, and adding
+# one period back is enough. That is two operations instead of the four a
+# general masked difference needs, in the hottest loop in the program.
+_TICKS_PERIOD = 1 << 29
+
+
 class VelocityEstimator:
     """Velocity measured across a time window, not between adjacent samples.
 
@@ -211,49 +220,71 @@ class VelocityEstimator:
     than the window, so changing the window at runtime takes effect
     immediately and costs nothing extra.
 
-    Timestamps are integer nanoseconds (time.monotonic_ns), because
-    time.monotonic() is a float whose resolution degrades with uptime - by
-    itself enough to corrupt a 150ms measurement during a long show.
+    Timestamps are supervisor.ticks_ms(), deliberately, and this matters for
+    throughput. time.monotonic_ns() returns nanoseconds, which after a second
+    of uptime exceed CircuitPython's small-integer range - so every timestamp
+    subtraction and comparison allocated a heap object and ran through
+    arbitrary-precision arithmetic. Measured on this board, that alone cost
+    ~0.5ms per poll, about 12% of the loop. ticks_ms() stays a small int.
+
+    time.monotonic() is not an option either: it is a float whose resolution
+    degrades with uptime, by itself enough to corrupt a 150ms measurement
+    during a long show.
+
+    1ms resolution across a ~150ms window is ~0.7% of velocity - far below the
+    accuracy to which the lead time can be judged by eye.
     """
 
     def __init__(self, capacity=400):
         self._pos = array("i", [0] * capacity)
-        self._t = array("q", [0] * capacity)
+        self._t = array("i", [0] * capacity)
         self._cap = capacity
         self._head = 0
         self._tail = 0
 
-    def update(self, position, t_ns, window_ns):
+    def update(self, position, t_ms, window_ms):
         """Add a sample and return the current velocity in counts/second.
 
-        `window_ns` is the window in integer nanoseconds; the caller keeps it
+        `window_ms` is the window in whole milliseconds; the caller keeps it
         precomputed because this runs a couple of hundred times a second.
         """
+        # Hoisted into locals: attribute lookups are markedly slower than
+        # local slots, and this is the hottest code in the program.
+        pos = self._pos
+        times = self._t
         cap = self._cap
         idx = self._head
-        self._pos[idx] = position
-        self._t[idx] = t_ns
+
+        pos[idx] = position
+        times[idx] = t_ms
 
         nxt = idx + 1
         if nxt >= cap:
             nxt = 0
-        if nxt == self._tail:  # ring full - drop the oldest sample
-            tail = self._tail + 1
-            self._tail = 0 if tail >= cap else tail
-        self._head = nxt
-
         tail = self._tail
-        # Keep the oldest sample that is still inside the window.
-        while tail != idx and (t_ns - self._t[tail]) > window_ns:
+        if nxt == tail:  # ring full - drop the oldest sample
             tail += 1
             if tail >= cap:
                 tail = 0
+        self._head = nxt
+
+        # Keep the oldest sample that is still inside the window.
+        while tail != idx:
+            dt = t_ms - times[tail]
+            if dt < 0:
+                dt += _TICKS_PERIOD
+            if dt <= window_ms:
+                break
+            tail += 1
+            if tail >= cap:
+                tail = 0
+        else:
+            dt = 0
         self._tail = tail
 
-        dt = t_ns - self._t[tail]
         if dt <= 0:
             return 0.0
-        return (position - self._pos[tail]) * 1000000000.0 / dt
+        return (position - pos[tail]) * 1000.0 / dt
 
 
 # Tuning values are held in NVM so they survive a power cycle. The board
@@ -833,7 +864,9 @@ while True:
         raw_value = 0
         velocity = 0.0
         cached_window = velocity_window
-        cached_window_ns = int(velocity_window * 1000000000.0)
+        cached_window_ms = int(velocity_window * 1000.0)
+        # Bound method into a local: one attribute lookup saved per poll.
+        estimator_update = velocity_estimator.update
 
         # eth.link_status is a full SPI register read (~470us). Checking it
         # every iteration cost ~5% of the loop budget, so it moves into the
@@ -848,9 +881,9 @@ while True:
                 raw_value = value
                 if velocity_window != cached_window:
                     cached_window = velocity_window
-                    cached_window_ns = int(velocity_window * 1000000000.0)
-                velocity = velocity_estimator.update(
-                    value, time.monotonic_ns(), cached_window_ns
+                    cached_window_ms = int(velocity_window * 1000.0)
+                velocity = estimator_update(
+                    value, supervisor.ticks_ms(), cached_window_ms
                 )
                 # One bad reading must not fling the prediction across the stage.
                 if velocity > MAX_SPEED_COUNTS_S:

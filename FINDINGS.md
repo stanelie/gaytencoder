@@ -239,6 +239,32 @@ USB is attached, hence NVM rather than a config file.
 can be removed from the real video chain beats predicting around it, since
 prediction only ever guesses.
 
+### Nanosecond timestamps cost 12% of the loop
+
+Adding the estimator dropped throughput from ~210 to ~185 messages/second.
+Measured by simply removing it: the board polled 261/s without it against
+230/s with, so it cost ~0.5ms per poll - far more than a ring-buffer write
+and a subtraction should.
+
+The cause was the time source. `time.monotonic_ns()` returns nanoseconds,
+which after one second of uptime exceed CircuitPython's small-integer range,
+so every timestamp stored, subtracted or compared allocated a heap object and
+ran through arbitrary-precision arithmetic - several times per poll.
+
+`supervisor.ticks_ms()` returns a small int and recovered most of it:
+**230 -> 246 polls/s idle, and 187 -> 197 sends/s** under a forced-send test.
+
+The cost is resolution: 1ms across a ~150ms window is ~0.7% of velocity, well
+under the accuracy to which the lead time can be judged by eye. `ticks_ms()`
+wraps every ~6.2 days, so differences need handling - but since every interval
+measured is well under a second, a negative difference can only mean a wrap,
+and adding one period back is enough. `tools/test_velocity.py` covers that
+path, which would otherwise only ever run in production.
+
+Simplifying the wrap arithmetic further, and hoisting attribute lookups into
+locals, made no measurable difference on top of that - the allocation was the
+whole story.
+
 ---
 
 ## 6. Encoder reference
