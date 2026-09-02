@@ -168,7 +168,34 @@ live in the board's NVM (not the filesystem, which the board cannot write
 while USB is attached) and are restored on boot; `config.py` only supplies
 defaults for a board that has never been tuned.
 
-Suggested procedure:
+#### The tuner app (macOS / anything with Python 3)
+
+`tools/osc_tuner.py` is a small control panel for exactly these two settings.
+Run it:
+
+```bash
+python3 tools/osc_tuner.py
+```
+
+It opens a browser page with a slider for each value, nudge buttons for fine
+adjustment, and a Save button. Changes are sent as you drag. The board's IP,
+port and OSC prefix are editable at the top, so the same tool drives either
+board — or pass them as arguments:
+
+```bash
+python3 tools/osc_tuner.py 10.8.0.241 9001 /encoder2
+```
+
+`tools/Encoder Tuner.command` is a double-clickable launcher for macOS; make
+it executable once with `chmod +x "tools/Encoder Tuner.command"`.
+
+It uses only the Python standard library — no `pip install`, and no tkinter,
+whose availability on macOS depends on how Python was installed. The UI is
+served to your browser because browsers cannot send UDP themselves; the web
+server binds to localhost only and nothing is exposed to the network. macOS
+may ask for local-network permission the first time it sends.
+
+#### Suggested procedure
 
 1. Move the screen at a steady, representative speed.
 2. Adjust `/encoder1/lead` until the background stops sliding against the

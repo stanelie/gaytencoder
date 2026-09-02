@@ -1,0 +1,7 @@
+# Keep LF endings everywhere. Two things actually break otherwise:
+# a .command file with CRLF fails on macOS with "bad interpreter", and
+# CRLF in .py files is untidy on the CIRCUITPY drive.
+* text=auto eol=lf
+*.py text eol=lf
+*.command text eol=lf
+*.md text eol=lf
