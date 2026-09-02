@@ -418,27 +418,37 @@ class FastOSCSender:
         self._ptr_buf = bytearray([0x00, self._SNTX_WR, reg_write, 0x00, 0x00])
         self._cmd_buf = bytearray([0x00, self._SNCR, reg_write, self._CMD_SEND])
 
-        # Payload buffer: 3-byte header + the OSC message, patched in place.
+        # Two separate buffers, deliberately. The hot-path buffer holds the
+        # prebuilt position message and only ever has its float patched; the
+        # scratch buffer takes arbitrary messages. Sharing one buffer means a
+        # longer status message overwrites the position template sitting in
+        # the first bytes, and every subsequent position packet goes out
+        # carrying the wrong address - silently, since the send itself
+        # succeeds. (That regression is exactly what this comment exists to
+        # prevent a repeat of.)
         message, float_offset = build_osc_float_template(osc_address)
         self._msg_len = len(message)
-        self._data_buf = bytearray(3) + message + bytearray(self._MAX_PAYLOAD - len(message))
+        self._data_buf = bytearray(3) + message
         self._data_buf[2] = self._tx_ctrl
         self._float_offset = 3 + float_offset
+
+        self._scratch_buf = bytearray(3 + self._MAX_PAYLOAD)
+        self._scratch_buf[2] = self._tx_ctrl
 
     def send(self, value):
         """Hot path: patch the float32 in place and send. No allocation."""
         struct.pack_into(">f", self._data_buf, self._float_offset, float(value))
-        self._send_frame(self._msg_len)
+        self._send_frame(self._data_buf, self._msg_len)
 
     def send_bytes(self, payload):
         """Send an arbitrary pre-built OSC message (low-rate use)."""
         n = len(payload)
         if n > self._MAX_PAYLOAD:
             raise ValueError("payload too large")
-        self._data_buf[3 : 3 + n] = payload
-        self._send_frame(n)
+        self._scratch_buf[3 : 3 + n] = payload
+        self._send_frame(self._scratch_buf, n)
 
-    def _send_frame(self, n):
+    def _send_frame(self, buf, n):
         device = self._device
 
         # Each operation below MUST get its own `with device` block. In the
@@ -467,10 +477,10 @@ class FastOSCSender:
 
         # 3. Payload into the TX buffer at that offset.
         address = self._tx_base + (pointer & self._SOCK_MASK)
-        self._data_buf[0] = (address >> 8) & 0xFF
-        self._data_buf[1] = address & 0xFF
+        buf[0] = (address >> 8) & 0xFF
+        buf[1] = address & 0xFF
         with device as bus:
-            bus.write(self._data_buf, end=3 + n)
+            bus.write(buf, end=3 + n)
 
         # 4. Advance the write pointer.
         pointer = (pointer + n) & 0xFFFF
