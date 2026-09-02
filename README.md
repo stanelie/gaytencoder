@@ -67,35 +67,39 @@ handled automatically.
 | Setting | Purpose |
 |---|---|
 | `OSC_HOST` / `OSC_PORT` | where to send OSC |
-| `OSC_ADDRESS` | OSC address pattern, e.g. `/encoder1/position` |
+| `OSC_PREFIX` | this board's identity, e.g. `/encoder1` (default only; NVM wins) |
 | `MODBUS_SLAVE_ADDR` | which encoder this board talks to (factory default `1`) |
 | `HOSTNAME` | DHCP hostname; give each board a unique one |
 | `USE_DHCP` | `False` selects a static IP derived from the board's MAC |
 | `ENCODER_MODULUS` | counter span, `4096 * 100` — see [FINDINGS.md](FINDINGS.md) |
 | `LEAD_TIME_S` | video-pipeline latency to compensate (default only; NVM wins) |
 | `VELOCITY_WINDOW_S` | velocity averaging window (default only; NVM wins) |
-| `OSC_LISTEN_PORT` | port for live tuning messages |
+| `OSC_LISTEN_PORT` | port the board listens on for tuning messages |
+| `OSC_STATUS_PORT` | port the board sends diagnostics back to |
+| `OSC_ANNOUNCE_PORT` / `OSC_ANNOUNCE_S` | discovery beacon port and interval (`0` disables) |
 
 ### Second board
 
 The design uses one ESP32 per encoder, each with its own RS485 link and its
-own Ethernet connection, rather than sharing one RS485 bus. Only three values
-need changing for board 2:
+own Ethernet connection, rather than sharing one RS485 bus.
+
+`code.py` is byte-for-byte identical on both boards. The only thing that has
+to differ is the OSC prefix, and that can be set over the network — point the
+tuner at the second board's IP, type `/encoder2`, press **Set prefix**, then
+**Save**. Nothing needs editing or redeploying.
+
+If you would rather have it right from first boot, set it in `config.py`
+before copying:
 
 ```python
-HOSTNAME = "encoder-bridge-2"
-OSC_ADDRESS = "/encoder2/position"
-OSC_STATUS_ADDRESS = "/encoder2/status"
-OSC_CTRL_LEAD = "/encoder2/lead"        # control addresses too
-OSC_CTRL_WINDOW = "/encoder2/window"
-OSC_CTRL_SAVE = "/encoder2/save"
-MODBUS_SLAVE_ADDR = 1          # can stay 1 - separate buses, no collision
+HOSTNAME = "encoder-bridge-2"   # DHCP hostname, unrelated to OSC
+OSC_PREFIX = "/encoder2"        # default only; a saved value overrides it
+MODBUS_SLAVE_ADDR = 1           # can stay 1 - separate buses, no collision
 ```
 
-Each board tunes independently, so the two can have different lead times if
-their video paths differ.
-
-`code.py` itself is identical on both boards.
+The control addresses do not change between boards — they are always
+`/control/...`, and the IP distinguishes the two. Each board stores its own
+tuning, so they can have different lead times if their video paths differ.
 
 Keeping the encoders on separate buses means a failed encoder can be swapped
 for a factory-fresh one without re-addressing it, each encoder gets the full
@@ -117,11 +121,32 @@ Position is in encoder counts, ~11.8 counts/mm on this rig (measured: 3545
 counts over 300 mm). Values are signed and continuous through zero — see
 [FINDINGS.md](FINDINGS.md) for why that matters.
 
-Plus a low-rate diagnostic message (10 Hz by default) for tuning:
+That is the **only** thing sent to `OSC_HOST` — the stream Millumin sees
+contains nothing else.
+
+There is also a diagnostic message, but it is deliberately kept off that
+stream. It goes to whichever machine last sent a control message, on
+`OSC_STATUS_PORT` — in practice the tuner app, which subscribes simply by
+being used:
 
 ```
-/encoder1/status  ,ffff  <raw counts> <velocity counts/s> <lead s> <window s>
+/encoder1/status  ,ffff  <position counts> <velocity counts/s> <lead s> <window s>
 ```
+
+With no tuner running the board sends no status at all, so during a show it
+costs nothing.
+
+Each board also broadcasts a discovery beacon so the tuner can list what is on
+the network without anyone knowing an IP address:
+
+```
+/encoder/announce  ,sfff  <prefix> <position> <lead> <window>
+```
+
+Sent to `255.255.255.255` every `OSC_ANNOUNCE_S` seconds. The limited
+broadcast address is deliberate — the W5500 ARPs for ordinary destinations,
+so a subnet-directed broadcast like `10.8.0.255` would ARP for an address
+nothing answers to and the sends would silently fail.
 
 ---
 
@@ -159,35 +184,69 @@ port `9001`:
 
 | Message | Effect |
 |---|---|
-| `/encoder1/lead <float>` | seconds of latency to compensate (0–5) |
-| `/encoder1/window <float>` | velocity averaging window, seconds (0.005–2) |
-| `/encoder1/save` | persist both to NVM |
+| `/control/lead <float>` | seconds of latency to compensate (0–5) |
+| `/control/window <float>` | velocity averaging window, seconds (0.005–2) |
+| `/control/prefix <string>` | this board's outgoing OSC identity, e.g. `/encoder2` |
+| `/control/dest <string> [<int>]` | where position messages go: IP, optionally port |
+| `/control/ping` | keepalive; holds the status subscription open |
+| `/control/save` | force an immediate write to NVM |
 
-Out-of-range values are rejected and logged rather than applied. Saved values
-live in the board's NVM (not the filesystem, which the board cannot write
-while USB is attached) and are restored on boot; `config.py` only supplies
-defaults for a board that has never been tuned.
+**Changes are saved automatically.** Anything accepted is written to NVM
+within a second, batched so that a flurry of adjustments is still only one
+flash write. `/control/save` remains for scripted use but is not needed.
+
+These addresses are **fixed and carry no prefix**. The IP address already says
+which board you are talking to, and if the control addresses depended on the
+prefix you would have to know a board's current prefix in order to change it.
+
+Out-of-range values and malformed prefixes are rejected and logged rather than
+applied, and an unrecognised address says so on the console. Saved values live
+in the board's NVM (not the filesystem, which the board cannot write while USB
+is attached) and are restored on boot; `config.py` only supplies defaults for a
+board that has never been tuned.
 
 #### The tuner app (macOS / anything with Python 3)
 
-`tools/osc_tuner.py` is a small control panel for exactly these two settings.
-Run it:
+`tools/osc_tuner.py` is a control panel for everything a board can be told.
+It takes no arguments — boards are discovered, not addressed:
 
 ```bash
 python3 tools/osc_tuner.py
 ```
 
-It opens a browser page with a slider for each value, nudge buttons for fine
-adjustment, and a Save button. Changes are sent as you drag. The board's IP,
-port and OSC prefix are editable at the top, so the same tool drives either
-board — or pass them as arguments:
+From the repository root, or with the full path from anywhere:
 
 ```bash
-python3 tools/osc_tuner.py 10.8.0.241 9001 /encoder2
+python3 ~/gaytencoder/tools/osc_tuner.py
 ```
 
-`tools/Encoder Tuner.command` is a double-clickable launcher for macOS; make
-it executable once with `chmod +x "tools/Encoder Tuner.command"`.
+On macOS, `tools/Encoder Tuner.command` is a double-clickable launcher; make
+it executable once with `chmod +x "tools/Encoder Tuner.command"`. It opens the
+panel in your browser automatically.
+
+**Boards are discovered automatically.** Each one broadcasts a beacon every
+two seconds, and the panel lists what it hears — prefix, IP and live position.
+Click a row to select it, and its current settings are filled in from the
+board itself. With a single board on the network it selects itself. If two are
+indistinguishable on paper, pull one of the ropes and watch which row's
+position moves.
+
+Everything fits on one screen:
+
+| Control | Behaviour |
+|---|---|
+| Lead / window sliders | apply when you release the slider |
+| Lead / window fields | type a value, apply on Enter |
+| Sends as / to / port | apply on the **Apply** button |
+| Status tiles | position, velocity and the resulting correction, live |
+
+There is no Save button — every accepted change is written to the board's NVM
+within a second.
+
+The status readout appears only while the panel is open; a quiet ping keeps
+that subscription alive. If discovery is blocked (some managed switches and
+VLANs drop broadcast traffic) the list stays empty — that is the one case
+where you would need to reach a board another way.
 
 It uses only the Python standard library — no `pip install`, and no tkinter,
 whose availability on macOS depends on how Python was installed. The UI is
@@ -198,12 +257,12 @@ may ask for local-network permission the first time it sends.
 #### Suggested procedure
 
 1. Move the screen at a steady, representative speed.
-2. Adjust `/encoder1/lead` until the background stops sliding against the
+2. Adjust `/control/lead` until the background stops sliding against the
    screen — too low and it lags behind the move, too high and it leads.
 3. Stop the screen and watch for jitter or hunting in the still image. If
-   present, raise `/encoder1/window`; if the response feels sluggish when
+   present, raise `/control/window`; if the response feels sluggish when
    starting and stopping, lower it.
-4. `/encoder1/save` once you are happy.
+4. Nothing to confirm — each change is saved to the board as you make it.
 
 `/encoder1/status` reports raw position, measured velocity and the current
 tuning values throughout, which makes it much easier to see what the board

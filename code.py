@@ -33,19 +33,35 @@ from config import (
     STATIC_GATEWAY,
     OSC_HOST,
     OSC_PORT,
-    OSC_ADDRESS,
+    OSC_PREFIX,
     MODBUS_SLAVE_ADDR,
     ENCODER_MODULUS,
     LEAD_TIME_S,
     VELOCITY_WINDOW_S,
     MAX_SPEED_COUNTS_S,
     OSC_LISTEN_PORT,
-    OSC_CTRL_LEAD,
-    OSC_CTRL_WINDOW,
-    OSC_CTRL_SAVE,
-    OSC_STATUS_ADDRESS,
     OSC_STATUS_HZ,
+    OSC_STATUS_PORT,
+    OSC_STATUS_TIMEOUT_S,
+    OSC_ANNOUNCE_PORT,
+    OSC_ANNOUNCE_S,
 )
+
+# Discovery beacon. Fixed address, no prefix: it is how a board says who it
+# is, so it cannot depend on knowing that already.
+OSC_ANNOUNCE_ADDRESS = "/encoder/announce"
+
+# Control addresses are fixed and carry no prefix. The IP address already
+# identifies the board, and prefix-dependent control addresses would mean
+# needing to know a board's current prefix before being able to change it.
+OSC_CTRL_LEAD = "/control/lead"
+OSC_CTRL_WINDOW = "/control/window"
+OSC_CTRL_PREFIX = "/control/prefix"
+OSC_CTRL_DEST = "/control/dest"
+OSC_CTRL_SAVE = "/control/save"
+# Keepalive. Sending anything refreshes the status subscription, but the tuner
+# needs something harmless to send when nothing is being changed.
+OSC_CTRL_PING = "/control/ping"
 
 _HALF_MODULUS = ENCODER_MODULUS // 2
 
@@ -243,43 +259,120 @@ class VelocityEstimator:
 # Tuning values are held in NVM so they survive a power cycle. The board
 # cannot write its own CIRCUITPY filesystem while USB is attached, so
 # config.py only supplies the defaults for a board that has never been tuned.
-_NVM_MAGIC = b"ENC1"
+# Every operator-settable value lives here, so a board keeps its whole
+# identity across a power cycle. Layout:
+#   magic(4) lead(4) window(4) prefix_len(1) prefix(31) dest_len(1) dest(15)
+# The magic is bumped whenever the layout changes, so an older blob is
+# ignored rather than misread as the new shape.
+_NVM_MAGIC = b"ENC4"
+_NVM_SIZE = 64
+_PREFIX_MAX = 31
+_DEST_MAX = 15  # "255.255.255.255"
+_PREFIX_AT = 12
+_DEST_AT = 44
+_PORT_AT = 60
 
 
-def load_tuning(default_lead, default_window):
+def valid_prefix(prefix):
+    """A prefix must be a plain OSC container: '/name', no spaces or wildcards."""
+    if not prefix or len(prefix) > _PREFIX_MAX or prefix[0] != "/":
+        return False
+    for ch in prefix:
+        if ch in " #*,?[]{}\x00" or ord(ch) < 0x20 or ord(ch) > 0x7E:
+            return False
+    return True
+
+
+def valid_ipv4(text):
+    parts = text.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part or len(part) > 3:
+            return False
+        for ch in part:
+            if ch < "0" or ch > "9":
+                return False
+        if int(part) > 255:
+            return False
+    return True
+
+
+def _read_string(blob, at, limit, validator, fallback):
+    length = blob[at]
+    if 0 < length <= limit:
+        try:
+            candidate = str(blob[at + 1 : at + 1 + length], "utf-8")
+            if validator(candidate):
+                return candidate
+        except UnicodeError:
+            pass
+    return fallback
+
+
+def load_tuning(defaults):
+    """defaults = (lead, window, prefix, dest, port) -> same tuple + restored flag."""
     try:
         nvm = microcontroller.nvm
         if nvm is None:
-            return default_lead, default_window, False
-        blob = nvm[0:12]
-        if bytes(blob[0:4]) != _NVM_MAGIC:
-            return default_lead, default_window, False
-        lead, window = struct.unpack(">ff", bytes(blob[4:12]))
+            return defaults + (False,)
+        blob = bytes(nvm[0:_NVM_SIZE])
+        if blob[0:4] != _NVM_MAGIC:
+            return defaults + (False,)
+        lead, window = struct.unpack(">ff", blob[4:12])
         # Refuse implausible stored values rather than trusting NVM blindly.
-        if 0.0 <= lead <= 5.0 and 0.005 <= window <= 2.0:
-            return lead, window, True
+        if not (0.0 <= lead <= 5.0 and 0.005 <= window <= 2.0):
+            return defaults + (False,)
+        prefix = _read_string(blob, _PREFIX_AT, _PREFIX_MAX, valid_prefix, defaults[2])
+        dest = _read_string(blob, _DEST_AT, _DEST_MAX, valid_ipv4, defaults[3])
+        port = struct.unpack(">H", blob[_PORT_AT : _PORT_AT + 2])[0]
+        if not 1 <= port <= 65535:
+            port = defaults[4]
+        return lead, window, prefix, dest, port, True
     except (AttributeError, OSError, ValueError):
         pass
-    return default_lead, default_window, False
+    return defaults + (False,)
 
 
-def save_tuning(lead, window):
+def save_tuning(lead, window, prefix, dest, port):
     try:
         nvm = microcontroller.nvm
         if nvm is None:
             return False
-        nvm[0:12] = _NVM_MAGIC + struct.pack(">ff", lead, window)
+        blob = bytearray(_NVM_SIZE)
+        blob[0:4] = _NVM_MAGIC
+        blob[4:12] = struct.pack(">ff", lead, window)
+        encoded = prefix.encode("utf-8")[:_PREFIX_MAX]
+        blob[_PREFIX_AT] = len(encoded)
+        blob[_PREFIX_AT + 1 : _PREFIX_AT + 1 + len(encoded)] = encoded
+        encoded = dest.encode("utf-8")[:_DEST_MAX]
+        blob[_DEST_AT] = len(encoded)
+        blob[_DEST_AT + 1 : _DEST_AT + 1 + len(encoded)] = encoded
+        blob[_PORT_AT : _PORT_AT + 2] = struct.pack(">H", port)
+        nvm[0:_NVM_SIZE] = blob
         return True
     except (AttributeError, OSError, ValueError):
         return False
 
 
-lead_time = LEAD_TIME_S
-velocity_window = VELOCITY_WINDOW_S
-lead_time, velocity_window, _restored = load_tuning(lead_time, velocity_window)
+(
+    lead_time,
+    velocity_window,
+    osc_prefix,
+    osc_dest,
+    osc_dest_port,
+    _restored,
+) = load_tuning((LEAD_TIME_S, VELOCITY_WINDOW_S, OSC_PREFIX, OSC_HOST, OSC_PORT))
 print(
-    "Lead time %.3fs, velocity window %.3fs (%s)"
-    % (lead_time, velocity_window, "restored from NVM" if _restored else "from config.py")
+    "Lead %.3fs, window %.3fs, prefix %s, destination %s:%d (%s)"
+    % (
+        lead_time,
+        velocity_window,
+        osc_prefix,
+        osc_dest,
+        osc_dest_port,
+        "restored from NVM" if _restored else "from config.py",
+    )
 )
 
 velocity_estimator = VelocityEstimator()
@@ -310,12 +403,15 @@ def build_osc_float_template(address):
 
 
 def osc_message(address, *args):
-    """Build an arbitrary OSC message. Used only for the low-rate status
-    message, so the allocations here do not matter."""
+    """Build an arbitrary OSC message. Used only for the low-rate status and
+    announce messages, so the allocations here do not matter."""
     tags = ","
     payload = b""
     for arg in args:
-        if isinstance(arg, float):
+        if isinstance(arg, str):
+            tags += "s"
+            payload += _osc_pad(arg.encode("utf-8"))
+        elif isinstance(arg, float):
             tags += "f"
             payload += struct.pack(">f", arg)
         else:
@@ -353,6 +449,12 @@ def parse_osc(data):
             elif tag == "i":
                 args.append(struct.unpack_from(">i", data, pos)[0])
                 pos += 4
+            elif tag == "s":
+                s_end = data.find(b"\x00", pos)
+                if s_end < 0:
+                    break
+                args.append(str(data[pos:s_end], "utf-8"))
+                pos = ((s_end - pos) // 4 + 1) * 4 + pos
             else:
                 break
         return address, args
@@ -426,14 +528,17 @@ class FastOSCSender:
         # carrying the wrong address - silently, since the send itself
         # succeeds. (That regression is exactly what this comment exists to
         # prevent a repeat of.)
+        self._scratch_buf = bytearray(3 + self._MAX_PAYLOAD)
+        self._scratch_buf[2] = self._tx_ctrl
+        self.set_address(osc_address)
+
+    def set_address(self, osc_address):
+        """Rebuild the prebuilt position message for a new OSC address."""
         message, float_offset = build_osc_float_template(osc_address)
         self._msg_len = len(message)
         self._data_buf = bytearray(3) + message
         self._data_buf[2] = self._tx_ctrl
         self._float_offset = 3 + float_offset
-
-        self._scratch_buf = bytearray(3 + self._MAX_PAYLOAD)
-        self._scratch_buf[2] = self._tx_ctrl
 
     def send(self, value):
         """Hot path: patch the float32 in place and send. No allocation."""
@@ -517,26 +622,80 @@ class ControlListener:
         self._buf = bytearray(256)
 
     def poll(self):
-        """Return (address, args) for one pending message, or (None, None)."""
+        """Return (address, args, sender_ip), or (None, None, None).
+
+        The sender's address matters: status messages are sent back to
+        whoever last talked to us, so the tuner receives them without needing
+        to be configured anywhere.
+        """
         with self._device as bus:
             bus.write_readinto(self._rsr_out, self._rsr_in)
         if ((self._rsr_in[3] << 8) | self._rsr_in[4]) == 0:
-            return None, None
+            return None, None, None
         try:
-            count = self._sock.recv_into(self._buf, len(self._buf))
+            count, sender = self._sock.recvfrom_into(self._buf, len(self._buf))
         except OSError:
-            return None, None
+            return None, None, None
         if not count:
-            return None, None
+            return None, None, None
         # bytes() copy rather than a memoryview: CircuitPython memoryviews
         # have no .find(). This path runs only when a tuning message actually
         # arrives, so the allocation is irrelevant.
-        return parse_osc(bytes(self._buf[:count]))
+        address, args = parse_osc(bytes(self._buf[:count]))
+        return address, args, (sender[0] if sender else None)
 
 
 def apply_control(address, args):
     """Handle one tuning command. Returns True if something changed."""
-    global lead_time, velocity_window
+    global lead_time, velocity_window, osc_prefix, osc_dest, osc_dest_port
+
+    if address == OSC_CTRL_PING:
+        return False  # nothing to do; arriving at all refreshes the subscription
+
+    if address == OSC_CTRL_DEST:
+        # Address and port travel together so they change in one atomic step,
+        # rather than briefly pointing at a host/port pair that never existed.
+        if not args or not isinstance(args[0], str):
+            print("%s needs an address, e.g. 10.8.1.81 [port]" % address)
+            return False
+        candidate = args[0].strip()
+        if not valid_ipv4(candidate):
+            print("ignored invalid destination: %r" % (args[0],))
+            return False
+        port = osc_dest_port
+        if len(args) > 1:
+            try:
+                port = int(args[1])
+            except (TypeError, ValueError):
+                print("ignored invalid destination port: %r" % (args[1],))
+                return False
+            if not 1 <= port <= 65535:
+                print("ignored out-of-range destination port:", port)
+                return False
+        if candidate == osc_dest and port == osc_dest_port:
+            return False
+        osc_dest = candidate
+        osc_dest_port = port
+        print("destination -> %s:%d" % (osc_dest, osc_dest_port))
+        return True
+
+    if address == OSC_CTRL_PREFIX:
+        if not args or not isinstance(args[0], str):
+            print("%s needs a string argument, e.g. /encoder2" % address)
+            return False
+        candidate = args[0].strip()
+        if not candidate.startswith("/"):
+            candidate = "/" + candidate
+        if candidate.endswith("/"):
+            candidate = candidate[:-1]
+        if not valid_prefix(candidate):
+            print("ignored invalid prefix: %r" % (args[0],))
+            return False
+        if candidate == osc_prefix:
+            return False
+        osc_prefix = candidate
+        print("prefix -> %s (now sending %s/position)" % (osc_prefix, osc_prefix))
+        return True
 
     if address == OSC_CTRL_LEAD:
         if not args:
@@ -561,18 +720,25 @@ def apply_control(address, args):
         print("ignored out-of-range window:", value)
 
     elif address == OSC_CTRL_SAVE:
-        if save_tuning(lead_time, velocity_window):
-            print("saved: lead=%.3fs window=%.3fs" % (lead_time, velocity_window))
+        if save_tuning(lead_time, velocity_window, osc_prefix, osc_dest, osc_dest_port):
+            print(
+                "saved: lead=%.3fs window=%.3fs prefix=%s dest=%s:%d"
+                % (lead_time, velocity_window, osc_prefix, osc_dest, osc_dest_port)
+            )
         else:
             print("save failed (no NVM available)")
 
     else:
-        # Almost always a prefix mismatch - e.g. a tuner set to /encoder2
-        # pointed at the board that answers to /encoder1. Say so rather than
-        # ignoring it, otherwise the slider just appears to do nothing.
         print(
-            "ignored unknown address %s - this board answers to %s, %s, %s"
-            % (address, OSC_CTRL_LEAD, OSC_CTRL_WINDOW, OSC_CTRL_SAVE)
+            "ignored unknown address %s - expecting %s, %s, %s, %s or %s"
+            % (
+                address,
+                OSC_CTRL_LEAD,
+                OSC_CTRL_WINDOW,
+                OSC_CTRL_PREFIX,
+                OSC_CTRL_DEST,
+                OSC_CTRL_SAVE,
+            )
         )
 
     return False
@@ -596,6 +762,10 @@ def configure_static_ip(eth, pool):
 
 
 last_sent_value = None
+# Set when a tuning value changes, cleared once written to NVM. Changes are
+# persisted automatically, but batched to at most one flash write per second
+# so that a flurry of adjustments does not become a flurry of writes.
+tuning_dirty = False
 poll_count = 0
 error_count = 0
 send_count = 0
@@ -622,8 +792,12 @@ while True:
         sock.settimeout(0)
         # sendto() reconnects the hardware socket on every call; connect()
         # once so each packet is just a buffer write plus a SEND command.
-        sock.connect((OSC_HOST, OSC_PORT))
-        sender = FastOSCSender(sock, OSC_ADDRESS)
+        sock.connect((osc_dest, osc_dest_port))
+        sender = FastOSCSender(sock, osc_prefix + "/position")
+        status_address = osc_prefix + "/status"
+        active_prefix = osc_prefix
+        active_dest = (osc_dest, osc_dest_port)
+        print("Sending %s/position to %s:%d" % (osc_prefix, osc_dest, osc_dest_port))
 
         ctrl_sock = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
         ctrl_sock.settimeout(0)
@@ -633,6 +807,28 @@ while True:
 
         status_interval = 1.0 / OSC_STATUS_HZ if OSC_STATUS_HZ else 0
         next_status = time.monotonic()
+        # Status goes to whoever is tuning, on its own socket, and only while
+        # a subscription is live. With no tuner running - i.e. during a show -
+        # nothing is sent and the position stream is the only traffic.
+        status_sock = None
+        status_sender = None
+        status_dest = None
+        status_deadline = 0.0
+
+        # Discovery beacon, so the tuner can list boards without anyone
+        # knowing an IP address.
+        announce_sender = None
+        next_announce = time.monotonic()
+        if OSC_ANNOUNCE_S:
+            try:
+                announce_sock = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
+                announce_sock.settimeout(0)
+                announce_sock.connect(("255.255.255.255", OSC_ANNOUNCE_PORT))
+                announce_sender = FastOSCSender(announce_sock, OSC_ANNOUNCE_ADDRESS)
+                print("Announcing on port %d every %.0fs" % (OSC_ANNOUNCE_PORT, OSC_ANNOUNCE_S))
+            except (OSError, RuntimeError) as announce_err:
+                print("announce disabled:", announce_err)
+
         control_countdown = 0
         raw_value = 0
         velocity = 0.0
@@ -680,18 +876,80 @@ while True:
             control_countdown -= 1
             if control_countdown <= 0:
                 control_countdown = 20  # ~10 times/second at ~210Hz
-                address, args = control.poll()
+                address, args, sender_ip = control.poll()
                 if address is not None:
-                    apply_control(address, args)
+                    if apply_control(address, args):
+                        tuning_dirty = True
+
+                    # Any control message renews the status subscription and
+                    # points it at the sender.
+                    status_deadline = time.monotonic() + OSC_STATUS_TIMEOUT_S
+                    if sender_ip and sender_ip != status_dest and status_interval:
+                        try:
+                            if status_sock is None:
+                                status_sock = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
+                                status_sock.settimeout(0)
+                            status_sock.connect((sender_ip, OSC_STATUS_PORT))
+                            if status_sender is None:
+                                status_sender = FastOSCSender(status_sock, status_address)
+                            status_dest = sender_ip
+                            print("status -> %s:%d" % (status_dest, OSC_STATUS_PORT))
+                        except (OSError, RuntimeError) as status_err:
+                            print("status subscribe failed:", status_err)
+                            status_sender = None
+                            status_dest = None
+
+                    if osc_prefix != active_prefix:
+                        # Retarget both outgoing messages; the position
+                        # template is prebuilt, so it has to be rebuilt.
+                        active_prefix = osc_prefix
+                        sender.set_address(osc_prefix + "/position")
+                        status_address = osc_prefix + "/status"
+                        last_sent_value = None  # resend under the new address
+
+                    if (osc_dest, osc_dest_port) != active_dest:
+                        # Point the position socket at the new receiver. The
+                        # socket number is unchanged, so the sender's cached
+                        # registers stay valid.
+                        try:
+                            sock.connect((osc_dest, osc_dest_port))
+                            active_dest = (osc_dest, osc_dest_port)
+                            last_sent_value = None
+                            print("now sending to %s:%d" % (osc_dest, osc_dest_port))
+                        except (OSError, RuntimeError) as dest_err:
+                            print("could not retarget to %s: %s" % (osc_dest, dest_err))
+                            osc_dest, osc_dest_port = active_dest
 
             now = time.monotonic()
 
-            if status_interval and now >= next_status:
+            if announce_sender is not None and now >= next_announce:
+                next_announce = now + OSC_ANNOUNCE_S
+                try:
+                    announce_sender.send_bytes(
+                        osc_message(
+                            OSC_ANNOUNCE_ADDRESS,
+                            osc_prefix,
+                            osc_dest,
+                            osc_dest_port,
+                            float(raw_value),
+                            float(lead_time),
+                            float(velocity_window),
+                        )
+                    )
+                except (OSError, ValueError):
+                    pass
+
+            if (
+                status_interval
+                and status_sender is not None
+                and now < status_deadline
+                and now >= next_status
+            ):
                 next_status = now + status_interval
                 try:
-                    sender.send_bytes(
+                    status_sender.send_bytes(
                         osc_message(
-                            OSC_STATUS_ADDRESS,
+                            status_address,
                             float(raw_value),
                             float(velocity),
                             float(lead_time),
@@ -719,6 +977,17 @@ while True:
                 poll_count = 0
                 error_count = 0
                 send_count = 0
+
+                if tuning_dirty:
+                    if save_tuning(lead_time, velocity_window, osc_prefix, osc_dest, osc_dest_port):
+                        print(
+                            "saved: lead=%.3fs window=%.3fs prefix=%s dest=%s:%d"
+                            % (lead_time, velocity_window, osc_prefix, osc_dest, osc_dest_port)
+                        )
+                    else:
+                        print("auto-save failed (no NVM available)")
+                    tuning_dirty = False
+
                 gc.collect()
                 rate_window_start = now
                 if not eth.link_status:

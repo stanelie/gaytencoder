@@ -20,7 +20,9 @@ import digitalio
 import adafruit_wiznet5k.adafruit_wiznet5k_socketpool as socketpool
 from adafruit_wiznet5k.adafruit_wiznet5k import WIZNET5K
 
-from config import USE_DHCP, HOSTNAME, OSC_HOST, OSC_PORT, OSC_ADDRESS
+from config import USE_DHCP, HOSTNAME, OSC_HOST, OSC_PORT, OSC_PREFIX
+
+OSC_ADDRESS = OSC_PREFIX + "/position"
 
 cs = digitalio.DigitalInOut(board.IO14)
 rst = digitalio.DigitalInOut(board.IO9)

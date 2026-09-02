@@ -10,10 +10,24 @@ HOSTNAME = "encoder-bridge-1"       # give each board a unique hostname
 STATIC_NETMASK = "255.255.255.0"
 STATIC_GATEWAY = "10.8.1.1"
 
-# Where to send OSC messages - point this at the computer running your OSC receiver.
+# Where to send OSC position messages - the computer running your OSC receiver.
+#
+# OSC_HOST is a DEFAULT only: the destination can be set from the tuner and is
+# stored in NVM, and a stored value wins over this one. It applies to a board
+# that has never had its destination set.
+#
+# Discovery does not depend on it - beacons are broadcast - so a board with the
+# wrong destination still appears in the tuner and can be corrected.
 OSC_HOST = "10.8.1.81"
 OSC_PORT = 9000
-OSC_ADDRESS = "/encoder1/position"
+
+# This board's OSC identity. Outgoing messages are <prefix>/position and
+# <prefix>/status, so a second board only needs a different prefix.
+#
+# This is a DEFAULT: the prefix can be set live over OSC and stored in NVM,
+# and a stored value wins over this one. It only applies to a board that has
+# never had its prefix set.
+OSC_PREFIX = "/encoder1"
 
 # Which Modbus slave address this board's RS485 bus should talk to.
 MODBUS_SLAVE_ADDR = 1
@@ -56,26 +70,59 @@ VELOCITY_WINDOW_S = 0.15
 MAX_SPEED_COUNTS_S = 11.8 * 2000
 
 # --- Live tuning over OSC --------------------------------------------------
-# Send these from Millumin (or any OSC sender) to this board's IP on
-# OSC_LISTEN_PORT while watching the screen move:
+# Send these to this board's IP on OSC_LISTEN_PORT while watching the screen
+# move:
 #
-#   /encoder1/lead    <float seconds>   pipeline latency to compensate
-#   /encoder1/window  <float seconds>   velocity averaging window
-#   /encoder1/save                      persist both to NVM
+#   /control/lead    <float seconds>   pipeline latency to compensate
+#   /control/window  <float seconds>   velocity averaging window
+#   /control/prefix  <string>          this board's outgoing OSC prefix
+#   /control/save                      persist all three to NVM
+#
+# These control addresses are deliberately FIXED and carry no prefix: the IP
+# address already says which board you are talking to, and if they depended
+# on the prefix you would have to know a board's current prefix in order to
+# change it.
 #
 # Commands are polled a few times a second, so they apply promptly without
 # costing anything in the hot loop.
 OSC_LISTEN_PORT = 9001
-OSC_CTRL_LEAD = "/encoder1/lead"
-OSC_CTRL_WINDOW = "/encoder1/window"
-OSC_CTRL_SAVE = "/encoder1/save"
 
-# Low-rate diagnostic message: raw position, velocity (counts/s), and the
-# current lead/window values, so you can see what the board is actually doing
-# while tuning. Sent at OSC_STATUS_HZ, independent of the main position
-# stream. Set OSC_STATUS_HZ = 0 to disable.
-OSC_STATUS_ADDRESS = "/encoder1/status"
+# Low-rate diagnostic message on <prefix>/status, carrying four floats:
+#   position (counts), velocity (counts/s), lead (s), window (s)
+#
+# It is NOT sent to OSC_HOST alongside the position stream. It goes only to
+# whichever machine last sent a control message, on OSC_STATUS_PORT - in
+# practice, to the tuner app while you are actually tuning. That keeps the
+# stream Millumin sees to nothing but position messages, and means that during
+# a show, with no tuner running, the board sends no status at all and the
+# diagnostic costs zero framerate.
+#
+# The subscription lapses OSC_STATUS_TIMEOUT_S after the last control message;
+# the tuner pings periodically to hold it open.
 OSC_STATUS_HZ = 10
+OSC_STATUS_PORT = 9002
+OSC_STATUS_TIMEOUT_S = 15
+
+# --- Discovery -------------------------------------------------------------
+#
+# Each board broadcasts a beacon so the tuner can list what is on the network
+# and the operator never has to know an IP address. The beacon carries the
+# board's prefix, live position, and current tuning:
+#
+#   /encoder/announce  ,sfff  <prefix> <position> <lead> <window>
+#
+# Sent to 255.255.255.255 - the LIMITED broadcast address, deliberately. The
+# W5500 ARPs for ordinary destinations, and a subnet-directed broadcast such
+# as 10.8.0.255 would ARP for an address nothing answers to, so those sends
+# would silently fail. 255.255.255.255 is special-cased to the broadcast MAC.
+#
+# Live position is included so the operator can identify which physical
+# encoder is which: pull a rope and watch which entry in the list moves.
+#
+# One small packet every couple of seconds is far too little to affect the
+# position framerate. Set OSC_ANNOUNCE_S = 0 to disable.
+OSC_ANNOUNCE_PORT = 9003
+OSC_ANNOUNCE_S = 2.0
 
 # Full span of the encoder's multi-turn counter, in raw counts:
 #   counts-per-turn (4096, the datasheet default) x multi-turn range (100 turns)
