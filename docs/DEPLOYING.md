@@ -4,8 +4,12 @@ Everything needed to take a bare Waveshare ESP32-S3-ETH to a working encoder
 bridge. No toolchain, no `pip install`, no internet beyond the CircuitPython
 download in step 1.
 
+Download `gaytencoder-<version>.zip` from the
+[releases page](https://github.com/stanelie/gaytencoder/releases) and unpack
+it. You get:
+
 ```
-release/
+gaytencoder-1.0/
   CIRCUITPY/     copy the CONTENTS of this onto the board's drive
   tuner/         runs on your Mac or PC, not on the board
   utilities/     one-off jobs, run by temporarily replacing code.py
@@ -129,18 +133,19 @@ connected, since discovery works by scanning.
 
 FAT drives can truncate a file without complaining. To check what landed:
 
-```bash
-cd /Volumes/CIRCUITPY && shasum -a 256 -c <(grep 'CIRCUITPY/' /path/to/release/MANIFEST.txt | sed 's| CIRCUITPY/| |')
-```
+Compare against `MANIFEST.txt`, or just check sizes — a short
+`adafruit_wiznet5k.py` (should be ~56 KB) is the usual casualty.
 
-Or just compare sizes — a short `adafruit_wiznet5k.py` (should be ~56 KB) is
-the usual casualty.
+## Building this archive
 
-## Rebuilding this folder
-
-It is generated from the repository root:
+From a clone of the repository:
 
 ```bash
-python3 tools/build_release.py           # rebuild
-python3 tools/build_release.py --check   # verify it is current
+python3 tools/build_release.py
 ```
+
+It writes `dist/gaytencoder-<version>.zip`, taking the version from `VERSION`
+in `code.py` so the archive name and the string the board prints at boot
+cannot disagree. The archive is not committed — it belongs on the releases
+page, and a build artifact in the repository goes stale as soon as anything
+changes.

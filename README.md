@@ -67,10 +67,12 @@ without the movement flicker.
 
 ## Setup
 
-**Deploying a board? Use [`release/`](release/) — it contains everything
-needed, including the libraries, and [`release/README.md`](release/README.md)
-walks through it step by step.** The rest of this section is the same thing in
-brief, for working on the code rather than deploying it.
+**Deploying a board?** Download the archive from the
+[releases page](https://github.com/stanelie/gaytencoder/releases) — it
+contains everything needed including the libraries, and
+[docs/DEPLOYING.md](docs/DEPLOYING.md) walks through it step by step. The rest
+of this section is the same thing in brief, for working on the code rather
+than deploying it.
 
 1. Flash CircuitPython 10.3.0 for `waveshare_esp32_s3_eth`.
 2. Copy these onto the `CIRCUITPY` drive:

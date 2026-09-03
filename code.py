@@ -60,6 +60,10 @@ _ACTIVITY_GAP_MS = 100
 # distinguishable across a stage from "the network is not up yet".
 _FAULT_BLINK_MS = 250
 
+# Single source of truth for the version. tools/build_release.py reads this
+# to name the release archive, so the two cannot disagree.
+VERSION = "1.0"
+
 # Discovery beacon. Fixed address, no prefix: it is how a board says who it
 # is, so it cannot depend on knowing that already.
 OSC_ANNOUNCE_ADDRESS = "/encoder/announce"
@@ -167,6 +171,8 @@ class StatusLED:
 
 status_led = StatusLED(STATUS_LED_BRIGHTNESS)
 status_led.set(StatusLED.RED)  # booting
+
+print("gaytencoder %s" % VERSION)
 
 # ---------------------------------------------------------------------------
 # RS485 / Modbus-RTU encoder reading

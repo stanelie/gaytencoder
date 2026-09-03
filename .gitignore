@@ -7,3 +7,6 @@ __pycache__/
 System Volume Information/
 .DS_Store
 Thumbs.db
+
+# Build artifacts - the release archive belongs on the release page, not here
+dist/
