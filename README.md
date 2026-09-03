@@ -39,11 +39,16 @@ The onboard RGB LED reports state at a glance:
 
 | Colour | Meaning |
 |---|---|
-| red | booting, or link lost / encoder not answering |
+| red, steady | booting, or network link lost |
+| red, blinking ~2/sec | encoder not answering |
 | blue | network up, IP acquired, not yet streaming |
 | green | running normally |
 | blue blink over green | position is moving |
 | red blink, 0.2s | settings received and written to NVM |
+
+A board whose encoder is missing still boots, joins the network and accepts
+configuration — it simply cannot stream, and both the LED and the tuner say
+so. It recovers on its own when the encoder answers; no reset needed.
 
 Brightness is `STATUS_LED_BRIGHTNESS` in `config.py`; set it to `0` to go dark
 for a performance, since this board rides on the moving screen and may be in
@@ -61,6 +66,11 @@ without the movement flicker.
 ---
 
 ## Setup
+
+**Deploying a board? Use [`release/`](release/) — it contains everything
+needed, including the libraries, and [`release/README.md`](release/README.md)
+walks through it step by step.** The rest of this section is the same thing in
+brief, for working on the code rather than deploying it.
 
 1. Flash CircuitPython 10.3.0 for `waveshare_esp32_s3_eth`.
 2. Copy these onto the `CIRCUITPY` drive:
